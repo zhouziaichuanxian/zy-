@@ -1,0 +1,91 @@
+name: Ubuntu VNC Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ubuntu-vnc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3600
+
+    steps:
+      - name: Update APT
+        run: sudo apt-get update
+
+      - name: Prevent service auto-start during apt
+        run: |
+          echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Disable systemctl hooks
+        run: bash .github/workflows/scripts/disable-systemctl.sh
+
+      - name: Pre-create system users and directories
+        run: bash .github/workflows/scripts/precreate-users.sh
+
+      - name: Install Desktop and VNC Server
+        run: bash .github/workflows/scripts/install-desktop-vnc.sh
+
+      - name: Validate system users and tmpfiles
+        run: bash .github/workflows/scripts/validate-tmpfiles.sh
+
+      - name: Re-enable service start
+        run: bash .github/workflows/scripts/reenable-services.sh
+
+      - name: Configure VNC Server
+        run: |
+          mkdir -p ~/.vnc
+          PASS=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c 16)
+          echo "$PASS" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          echo "VNC_PASSWORD=$PASS" >> "$GITHUB_ENV"
+          cat > ~/.vnc/xstartup << 'EOF'
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
+          export XDG_SESSION_TYPE=x11
+          export GDK_BACKEND=x11
+          export QT_QPA_PLATFORM=xcb
+          exec dbus-launch /usr/bin/gnome-session --session=gnome
+          EOF
+          chmod +x ~/.vnc/xstartup
+          vncserver -kill :0 || true
+          vncserver :0 -localhost no -geometry 1280x800 -depth 24 -xstartup ~/.vnc/xstartup
+
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start tailscaled (manual)
+        run: |
+          sudo mkdir -p /var/run
+          nohup sudo tailscaled >/tmp/tailscaled.log 2>&1 & disown
+          sleep 3
+
+      - name: Connect to Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${GITHUB_RUN_ID}
+          echo "TAILSCALE_IP=$(tailscale ip -4)" >> "$GITHUB_ENV"
+
+      - name: Restore systemctl hooks
+        run: bash .github/workflows/scripts/restore-systemctl.sh
+
+      - name: Verify VNC Connection
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          nc -z -v "$TAILSCALE_IP" 5900
+
+      - name: Keep Connection Alive
+        run: |
+          echo "=== VNC ACCESS INFORMATION ==="
+          echo "Address: ${TAILSCALE_IP}:5900"
+          echo "Password: ${VNC_PASSWORD}"
+          echo "Desktop: GNOME"
+          echo "=============================="
+          while true; do
+            echo "[$(date)] VNC Active - Cancel workflow to terminate"
+            sleep 300
+          done
